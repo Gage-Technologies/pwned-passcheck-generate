@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/pterm/pterm"
 	"github.com/spf13/cobra"
@@ -89,10 +90,41 @@ func runDlCmd(cmd *cobra.Command, args []string) {
 		return
 	}
 
+	// create channel with up to 8 chunks buffered
+	q := make(chan []byte, 8)
+
+	// launch goroutine to async write to file wo we can buffer the file download
+	go func() {
+		for {
+			// wait for the next chunk
+			buf, ok := <-q
+			if !ok {
+				return
+			}
+
+			// update the checksum hashes
+			_, err = hasher.Write(buf)
+			if err != nil {
+				pterm.Fatal.Printf("failed to append to checksum buffer: %v\n", err)
+				return
+			}
+
+			// update the output file
+			_, err = f.Write(buf)
+			if err != nil {
+				pterm.Fatal.Printf("failed to append to output file: %v\n", err)
+				return
+			}
+
+			// update the progress bar
+			pb.Add(len(buf))
+		}
+	}()
+
 	// launch read loop
 	for {
-		// read a 1KiB chunk from the remote server
-		buf := make([]byte, 1024)
+		// read a 4MiB chunk from the remote server
+		buf := make([]byte, 1024*1024*4)
 		n, err := resp.Body.Read(buf)
 		if err != nil {
 			// exit quietly if we arex finished
@@ -103,25 +135,17 @@ func runDlCmd(cmd *cobra.Command, args []string) {
 			return
 		}
 
-		// trim the buffer
-		buf = buf[:n]
+		// trim the buffer and send to queue
+		q <- buf[:n]
+	}
 
-		// update the checksum hashes
-		_, err = hasher.Write(buf)
-		if err != nil {
-			pterm.Fatal.Printf("failed to append to checksum buffer: %v\n", err)
-			return
+	// wait for the queue to empty then close
+	for {
+		if len(q) > 0 {
+			time.Sleep(time.Millisecond * 10)
+			continue
 		}
-
-		// update the output file
-		_, err = f.Write(buf)
-		if err != nil {
-			pterm.Fatal.Printf("failed to append to output file: %v\n", err)
-			return
-		}
-
-		// update the progress bar
-		pb.Add(n)
+		close(q)
 	}
 
 	// stop progress bar
