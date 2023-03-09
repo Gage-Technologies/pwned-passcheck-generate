@@ -78,6 +78,12 @@ func runGenCmd(cmd *cobra.Command, args []string) {
 	// only add a total to the progress bar if we have a max configured
 	if maxSize > 0 {
 		pbBuilder = pbBuilder.WithTotal(maxSize)
+	} else {
+		info, err := os.Stat(args[0])
+		if err == nil {
+			// esitmate the size since the average line size is ~44 bytes
+			pbBuilder = pbBuilder.WithTotal(int(info.Size() / 44))
+		}
 	}
 
 	// start the progress bar
@@ -97,6 +103,11 @@ func runGenCmd(cmd *cobra.Command, args []string) {
 
 	// iterate the lines in the password archive adding them to the filter
 	for scanner.Scan() {
+		// skip corrupted data
+		if len(scanner.Text()) < 40 {
+			continue
+		}
+
 		// first 40 chars is sha1 sum
 		filter.AddString(scanner.Text()[:40])
 		// increment the progress bar

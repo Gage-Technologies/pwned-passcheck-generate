@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"encoding/binary"
 	"encoding/hex"
@@ -71,7 +72,7 @@ func runDlCmd(cmd *cobra.Command, args []string) {
 	size := 0
 
 	// launch goroutine to async write to file wo we can buffer the file download
-	wg.Go(func() {
+	go func() {
 		for {
 			// wait for the next chunk
 			buf, ok := <-q
@@ -99,7 +100,7 @@ func runDlCmd(cmd *cobra.Command, args []string) {
 			// update the progress bar
 			pb.Add(1)
 		}
-	})
+	}()
 
 	// launch workers to query the api
 	for i := 0; i < pwndRangeMax; i++ {
@@ -118,18 +119,7 @@ func runDlCmd(cmd *cobra.Command, args []string) {
 
 	// wait for the queue to fill so we know that the next
 	// empty wait loop is waiting to finish and not exiting before start
-	max := time.Now().Add(time.Second * 5)
-	for {
-		if time.Now().After(max) {
-			pterm.Fatal.Printf("downloader stalled waiting for queue to fill\n")
-			return
-		}
-		if len(q) == 0 {
-			time.Sleep(time.Millisecond * 10)
-			continue
-		}
-		break
-	}
+	wg.Wait()
 
 	// wait for the queue to empty then close
 	for {
@@ -138,7 +128,6 @@ func runDlCmd(cmd *cobra.Command, args []string) {
 			continue
 		}
 		close(q)
-		wg.Wait()
 		break
 	}
 
@@ -177,6 +166,12 @@ func getHashRange(r int) ([]byte, error) {
 		return nil, fmt.Errorf("failed to read response body: %v", err)
 	}
 
+	// prepend the range head to each of the hashes
+	out := [][]byte{}
+	for _, hash := range bytes.Split(body, []byte("\n")) {
+        out = append(out, append([]byte(encodedRange), hash...))
+    }
+
 	// return the hash range
-	return body, nil
+	return bytes.Join(out, []byte("\n")), nil
 }
