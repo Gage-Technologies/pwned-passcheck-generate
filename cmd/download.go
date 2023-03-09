@@ -2,16 +2,21 @@ package cmd
 
 import (
 	"crypto/sha1"
+	"encoding/binary"
 	"encoding/hex"
-	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
-	"strconv"
 	"time"
 
 	"github.com/pterm/pterm"
+	"github.com/sourcegraph/conc/pool"
 	"github.com/spf13/cobra"
+)
+
+const (
+	pwndRangeMax = 1024 * 1024
 )
 
 func init() {
@@ -30,58 +35,24 @@ var dlCmd = &cobra.Command{
 }
 
 func runDlCmd(cmd *cobra.Command, args []string) {
-	// open get request to the target server
-	req, err := http.NewRequest(
-		"GET",
-		"https://downloads.pwnedpasswords.com/passwords/pwned-passwords-sha1-ordered-by-count-v8.7z",
-		nil,
-	)
-	if err != nil {
-		pterm.Fatal.Printf("failed to create request: %v\n", err)
-		return
-	}
-
-	// open output file
+	// create new output file
 	f, err := os.Create(args[0])
 	if err != nil {
 		pterm.Fatal.Printf("failed to create output file: %v\n", err)
 		return
 	}
-	defer f.Close()
 
-	// create hasher to check the sum of the password file
+	// create new hasher to generate a sha1 hash of the file
 	hasher := sha1.New()
-
-	// send the request
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		pterm.Fatal.Printf("failed to send request: %v\n", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	// validate the status code
-	if resp.StatusCode != 200 {
-		pterm.Fatal.Printf("failed to download password hashes: %v\n", resp.StatusCode)
-		return
-	}
 
 	// create deafult progress bar
 	pbBuilder := pterm.DefaultProgressbar.
 		WithTitle("Downloading Password List").
 		WithBarStyle(pterm.NewStyle(pterm.FgCyan)).
 		WithTitleStyle(pterm.NewStyle(pterm.FgCyan)).
-		WithRemoveWhenDone(true)
-
-	// attempt to load the file size from the header
-	// and update the progress bar for the total bytes
-	if resp.Header.Get("Content-Length") != "" {
-		totalBytes, err := strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64)
-		if err == nil {
-			pbBuilder = pbBuilder.WithTotal(int(totalBytes))
-		}
-	}
+		WithRemoveWhenDone(true).
+		// set total to the max amount of ranges
+		WithTotal(pwndRangeMax)
 
 	// start progress bar
 	pb, err := pbBuilder.Start()
@@ -90,11 +61,17 @@ func runDlCmd(cmd *cobra.Command, args []string) {
 		return
 	}
 
-	// create channel with up to 8 chunks buffered
-	q := make(chan []byte, 8)
+	// create channel with up to 128 chunks buffered
+	q := make(chan []byte, 128)
+
+	// create worker pool to launch multiple goroutines
+	wg := pool.New().WithMaxGoroutines(129)
+
+	// create integer to track the size of the output file
+	size := 0
 
 	// launch goroutine to async write to file wo we can buffer the file download
-	go func() {
+	wg.Go(func() {
 		for {
 			// wait for the next chunk
 			buf, ok := <-q
@@ -116,27 +93,42 @@ func runDlCmd(cmd *cobra.Command, args []string) {
 				return
 			}
 
-			// update the progress bar
-			pb.Add(len(buf))
-		}
-	}()
+			// calculate new size
+			size += len(buf)
 
-	// launch read loop
-	for {
-		// read a 4MiB chunk from the remote server
-		buf := make([]byte, 1024*1024*4)
-		n, err := resp.Body.Read(buf)
-		if err != nil {
-			// exit quietly if we arex finished
-			if errors.Is(err, io.EOF) {
-				break
+			// update the progress bar
+			pb.Add(1)
+		}
+	})
+
+	// launch workers to query the api
+	for i := 0; i < pwndRangeMax; i++ {
+		wg.Go(func() {
+			// query the api for this range
+			buf, err := getHashRange(i)
+			if err != nil {
+				pterm.Fatal.Printf("failed to get hash range: %v\n", err)
+				return
 			}
-			pterm.Fatal.Printf("failed to read block from remote server: %v\n", err)
+
+			// send the buffer to the write queue
+			q <- buf
+		})
+	}
+
+	// wait for the queue to fill so we know that the next
+	// empty wait loop is waiting to finish and not exiting before start
+	max := time.Now().Add(time.Second * 5)
+	for {
+		if time.Now().After(max) {
+			pterm.Fatal.Printf("downloader stalled waiting for queue to fill\n")
 			return
 		}
-
-		// trim the buffer and send to queue
-		q <- buf[:n]
+		if len(q) == 0 {
+			time.Sleep(time.Millisecond * 10)
+			continue
+		}
+		break
 	}
 
 	// wait for the queue to empty then close
@@ -146,18 +138,45 @@ func runDlCmd(cmd *cobra.Command, args []string) {
 			continue
 		}
 		close(q)
+		wg.Wait()
+		break
 	}
 
 	// stop progress bar
 	_, _ = pb.Stop()
 
-	// check the checksum hash of the file
-	cksm := hex.EncodeToString(hasher.Sum(nil))
-	if cksm != "9c0a584e6799c09c648ded04d1e373172d54a77e" {
-		pterm.Fatal.Printf("failed to verify checksum of downloaded file: %v\n", cksm)
-		return
-	}
+	// close the temp file
+	_ = f.Close()
 
 	// print the response
-	pterm.Info.Printfln("\n##############################\nDownload Complete\nOutput File: %s", args[0])
+	pterm.Info.Printfln("##############################\nDownload Complete\nOutput File: %s\nSHA1 Checksum: %s", args[0], hex.EncodeToString(hasher.Sum(nil)))
+}
+
+// getHashRange
+//
+//	Retrieves a hash range from the Pwned Password Archive API
+func getHashRange(r int) ([]byte, error) {
+	// format int to hex encoded big endian
+	buf := make([]byte, 4)
+	binary.BigEndian.PutUint32(buf, uint32(r))
+	// trim the first 3 characters - I don't know why the did this but it's required
+	encodedRange := hex.EncodeToString(buf)[3:]
+
+	// query api for the hash range
+	url := fmt.Sprintf("https://api.pwnedpasswords.com/range/%s", encodedRange)
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query api: %v", err)
+	}
+
+	defer resp.Body.Close()
+
+	// read the response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %v", err)
+	}
+
+	// return the hash range
+	return body, nil
 }
