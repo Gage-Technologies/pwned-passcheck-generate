@@ -144,11 +144,14 @@ func runDlCmd(cmd *cobra.Command, args []string) {
 // getHashRange
 //
 //	Retrieves a hash range from the Pwned Password Archive API
+//
+//  API Reference: https://haveibeenpwned.com/API/v3#SearchingPwnedPasswordsByRange
 func getHashRange(r int) ([]byte, error) {
 	// format int to hex encoded big endian
 	buf := make([]byte, 4)
 	binary.BigEndian.PutUint32(buf, uint32(r))
-	// trim the first 3 characters - I don't know why the did this but it's required
+	// trim the first 3 characters since we wrote big-endian and only need
+	// a 5 character prefix in hex
 	encodedRange := hex.EncodeToString(buf)[3:]
 
 	// query api for the hash range
