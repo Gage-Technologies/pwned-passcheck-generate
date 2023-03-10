@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha1"
 	"encoding/binary"
 	"encoding/hex"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/coder/retry"
 	"github.com/pterm/pterm"
 	"github.com/sourcegraph/conc/pool"
 	"github.com/spf13/cobra"
@@ -71,49 +73,78 @@ func runDlCmd(cmd *cobra.Command, args []string) {
 	// create integer to track the size of the output file
 	size := 0
 
+	// create context for the download operation
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// launch goroutine to async write to file wo we can buffer the file download
 	go func() {
 		for {
-			// wait for the next chunk
-			buf, ok := <-q
-			if !ok {
-				return
+			// wait for the next chunk or context cancel
+			select {
+				case <-ctx.Done():
+                    return
+				case buf, ok := <-q:
+					if !ok {
+						return
+					}
+
+					// update the checksum hashes
+					_, err = hasher.Write(buf)
+					if err != nil {
+						cancel()
+						pterm.Fatal.Printf("failed to append to checksum buffer: %v\n", err)
+						return
+					}
+
+					// update the output file
+					_, err = f.Write(buf)
+					if err != nil {
+						cancel()
+						pterm.Fatal.Printf("failed to append to output file: %v\n", err)
+						return
+					}
+
+					// calculate new size
+					size += len(buf)
+
+					// update the progress bar
+					pb.Add(1)
 			}
-
-			// update the checksum hashes
-			_, err = hasher.Write(buf)
-			if err != nil {
-				pterm.Fatal.Printf("failed to append to checksum buffer: %v\n", err)
-				return
-			}
-
-			// update the output file
-			_, err = f.Write(buf)
-			if err != nil {
-				pterm.Fatal.Printf("failed to append to output file: %v\n", err)
-				return
-			}
-
-			// calculate new size
-			size += len(buf)
-
-			// update the progress bar
-			pb.Add(1)
 		}
 	}()
 
 	// launch workers to query the api
 	for i := 0; i < pwndRangeMax; i++ {
 		wg.Go(func() {
-			// query the api for this range
-			buf, err := getHashRange(i)
-			if err != nil {
-				pterm.Fatal.Printf("failed to get hash range: %v\n", err)
-				return
-			}
+			// perform retry on loop
+			retryCount := 0
+			for retrier := retry.New(time.Millisecond * 50, time.Second * 3); retrier.Wait(ctx); {
+				// check context for exit
+				select {
+                    case <-ctx.Done():
+                        return
+                    default:
+                }
 
-			// send the buffer to the write queue
-			q <- buf
+				// increment retry count here since this always executes
+				retryCount++
+
+				// query the api for this range
+				buf, err := getHashRange(i)
+				if err != nil {
+					// throw error if we've failed more than 20 times
+					if retryCount > 21 {
+						cancel()
+						pterm.Fatal.Printf("failed to get hash range: %v\n", err)
+						return
+					}
+					continue
+				}
+
+				// send the buffer to the write queue
+				q <- buf
+			}
 		})
 	}
 
@@ -121,12 +152,22 @@ func runDlCmd(cmd *cobra.Command, args []string) {
 	// empty wait loop is waiting to finish and not exiting before start
 	wg.Wait()
 
-	// wait for the queue to empty then close
+	// wait for the queue to empty or the context to cancel then close
 	for {
+		// check context
+		select {
+            case <-ctx.Done():
+                return
+            default:
+        }
+
+		// check queue
 		if len(q) > 0 {
 			time.Sleep(time.Millisecond * 10)
 			continue
 		}
+
+		// close the queue
 		close(q)
 		break
 	}
